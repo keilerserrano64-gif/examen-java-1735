@@ -155,3 +155,63 @@ Facturadas y Entregadas. Para guardarlo en UTF-8, escribe una ruta terminada en 
 El flujo de órdenes registra la fecha de entrega cuando la orden pasa a Entregado.
 Al completar o entregar una orden, el observador muestra en consola un aviso
 dirigido al correo del cliente después de confirmar la transacción.
+
+## Reserva concurrente de repuestos (condición de carrera)
+
+**Problema.** Dos técnicos podían reservar casi al mismo tiempo la última unidad de un repuesto.
+Reservar es una secuencia de tres pasos: leer cuánto hay disponible (stock menos lo ya reservado),
+verificar si alcanza y guardar la reserva. Si dos hilos ejecutan esa secuencia intercalada, ambos
+leen "hay 1", ambos pasan la verificación y ambos guardan su reserva: el sistema muestra dos
+reservas para una sola pieza física (*race condition*).
+
+**Solución.** La operación de reserva, `OrdenServicioServicio.agregarRepuesto`, ahora es *thread-safe*:
+
+- La sección crítica (lectura → verificación → escritura **y el `commit`**) se ejecuta dentro de un
+  bloque `synchronized` sobre un candado del repuesto. Solo un hilo a la vez puede reservar ese
+  repuesto; el siguiente espera y, cuando entra, ya ve la reserva confirmada del anterior.
+- Los candados están en un `ConcurrentHashMap` **estático** (uno por repuesto), así que funcionan aunque
+  cada técnico use su propia instancia del servicio (`InventarioProveedorServicio.reservar` crea una
+  nueva en cada llamada). Reservas de repuestos distintos no se bloquean entre sí.
+- Se sigue bloqueando la fila en MySQL (`SELECT … FOR UPDATE` en `RepuestoOrdenDao.bloquear`): el
+  candado de Java protege entre hilos del mismo programa y el de la base protege si hay varios
+  programas conectados a la misma base.
+- Cuando no alcanza, el servicio lanza `StockInsuficienteException` (subclase de
+  `IllegalArgumentException`, así los menús existentes siguen funcionando igual).
+- La aplicación (menú Órdenes) y la simulación usan la misma operación de reserva y el mismo DAO
+  (`RepuestoOrdenDao`). Reservar no descuenta `cantidad_stock`: lo que baja es la **disponibilidad**;
+  el stock físico se descuenta al completar la orden, como antes.
+
+**Simulación.** `com.carmotors.simulacion.MainReservaConcurrente` (fuera del menú del taller) registra
+el repuesto *Filtro de Aceite XY-123* con exactamente 1 unidad en stock, crea una orden por técnico y
+lanza dos hilos (`Hilo-Técnico-A` y `Hilo-Técnico-B`) que esperan la misma señal (`CountDownLatch`) para
+arrancar a la vez. Los dos usan la misma operación de reserva que la aplicación. Necesita una base con
+`schema.sql` y `data.sql` cargados y las variables `CARMOTORS_DB_*`. Desde la carpeta `proyecto-java-grupo06`:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=com.carmotors.simulacion.MainReservaConcurrente"
+```
+
+También se puede ejecutar su `main` desde IntelliJ. Salida esperada (el ganador puede ser A o B según
+quién entre primero):
+
+```text
+Iniciando simulación de reserva concurrente para el repuesto 'Filtro de Aceite XY-123'...
+Stock inicial: 1
+
+Hilo-Técnico-A: Intentando reservar el repuesto...
+Hilo-Técnico-B: Intentando reservar el repuesto...
+
+Hilo-Técnico-A: Verificando stock. Hay 1 disponible.
+Hilo-Técnico-A: ¡Reserva exitosa! Stock actualizado a 0.
+Hilo-Técnico-B: Verificando stock. Hay 0 disponible.
+Hilo-Técnico-B: Fallo en la reserva. No hay suficiente stock.
+
+Simulación finalizada.
+Reservó la última unidad: Hilo-Técnico-A
+Reserva rechazada: Hilo-Técnico-B
+Stock final del repuesto: 0
+```
+
+El stock que muestra la simulación es el **disponible** (stock menos lo reservado). Cada ejecución
+registra un repuesto nuevo y dos órdenes nuevas; usa una base de pruebas para no mezclar estos datos
+con los del taller.

@@ -1,6 +1,7 @@
 package com.carmotors.servicio;
 
 import com.carmotors.dao.*;
+import com.carmotors.excepcion.StockInsuficienteException;
 import com.carmotors.modelo.CatalogoServicios;
 import com.carmotors.modelo.CicloOrden;
 import com.carmotors.modelo.EstadoServicio;
@@ -11,6 +12,8 @@ import java.math.BigDecimal;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /** Creación, consulta, técnicos, repuestos y ciclo de estados de las órdenes de servicio. */
@@ -24,6 +27,29 @@ public class OrdenServicioServicio {
     public interface ObservadorCliente { void notificar(AvisoCliente aviso); }
 
     private record CambioEstado<T>(T resultado, AvisoCliente aviso) { }
+
+    /**
+     * Avisos de lo que pasa dentro de la sección crítica de una reserva. Se llaman mientras
+     * el hilo todavía tiene el candado, así el orden de los mensajes es el orden real.
+     * La aplicación no los usa; la simulación de concurrencia sí, para mostrar la carrera.
+     */
+    public interface ObservadorReserva {
+        /** Se acaba de leer el stock: hay {@code disponible} unidades sin reservar. */
+        default void verificando(int disponible) { }
+
+        /** La reserva quedó confirmada (commit hecho); quedan {@code disponible} unidades. */
+        default void reservado(int disponible) { }
+    }
+
+    private static final ObservadorReserva SIN_AVISOS = new ObservadorReserva() { };
+
+    /**
+     * Un candado (monitor) por repuesto, compartido por TODAS las instancias del servicio.
+     * Es estático porque cada técnico puede usar su propia instancia (por ejemplo,
+     * InventarioProveedorServicio.reservar crea una nueva en cada llamada). Dos técnicos
+     * que reservan el mismo repuesto se turnan; con repuestos distintos no se esperan.
+     */
+    private static final ConcurrentMap<Integer, Object> CANDADOS_REPUESTO = new ConcurrentHashMap<>();
 
     private static final System.Logger LOG = System.getLogger(OrdenServicioServicio.class.getName());
     private final List<ObservadorCliente> observadores = new CopyOnWriteArrayList<>();
@@ -137,11 +163,50 @@ public class OrdenServicioServicio {
      * Aparta (reserva) unidades de un repuesto para la orden. El stock NO baja todavía:
      * baja una sola vez, cuando la orden pasa a Completado.
      * Disponible = stock - lo que ya está reservado por otras órdenes.
+     *
+     * @return unidades que quedan disponibles después de la reserva
+     * @throws StockInsuficienteException si no hay unidades suficientes
      */
-    public void agregarRepuesto(int orden, int repuesto, int cantidad) throws SQLException {
+    public int agregarRepuesto(int orden, int repuesto, int cantidad) throws SQLException {
+        return agregarRepuesto(orden, repuesto, cantidad, SIN_AVISOS);
+    }
+
+    /**
+     * Misma operación de reserva, avisando a {@code observador} lo que pasa dentro de la sección crítica.
+     *
+     * <p><b>Thread-safe.</b> Leer el stock disponible, validarlo y guardar la reserva es una secuencia
+     * lectura-validación-escritura. Si dos hilos la ejecutan a la vez, ambos pueden leer "hay 1" y
+     * reservar la misma unidad (condición de carrera). Por eso toda la secuencia, incluido el
+     * {@code commit}, corre dentro de {@code synchronized} sobre el candado de ese repuesto: solo un
+     * hilo a la vez. Se incluye el commit para que el siguiente hilo lea la reserva ya guardada.
+     * Además, la fila del repuesto se bloquea en MySQL ({@code SELECT ... FOR UPDATE}), lo que protege
+     * también si hay varios programas conectados a la misma base.</p>
+     */
+    public int agregarRepuesto(int orden, int repuesto, int cantidad, ObservadorReserva observador)
+            throws SQLException {
         if (orden <= 0 || repuesto <= 0) throw new IllegalArgumentException("Orden y repuesto deben ser positivos.");
         if (cantidad <= 0) throw new IllegalArgumentException("La cantidad debe ser mayor a cero.");
-        enTransaccion(c -> {
+        java.util.Objects.requireNonNull(observador);
+        Object candado = CANDADOS_REPUESTO.computeIfAbsent(repuesto, id -> new Object());
+        synchronized (candado) {
+            // ---- Inicio de la sección crítica: un solo hilo por repuesto ----
+            int quedan = reservarEnTransaccion(orden, repuesto, cantidad, observador);
+            observador.reservado(quedan);
+            return quedan;
+            // ---- Fin de la sección crítica (se libera el candado al salir del bloque) ----
+        }
+    }
+
+    /** Unidades del repuesto que no están reservadas (stock - reservas activas). */
+    public int disponibleDe(int repuesto) throws SQLException {
+        if (repuesto <= 0) throw new IllegalArgumentException("Repuesto inválido.");
+        return enTransaccion(c -> repuestos.bloquear(c, repuesto).stock() - repuestos.totalReservado(c, repuesto));
+    }
+
+    /** Lectura, validación y escritura de la reserva. Solo se llama con el candado del repuesto tomado. */
+    private int reservarEnTransaccion(int orden, int repuesto, int cantidad, ObservadorReserva observador)
+            throws SQLException {
+        return enTransaccion(c -> {
             String estado = nombreEstado(c, ordenes.buscar(c, orden, true));
             if (!CicloOrden.admiteRepuestos(estado)) {
                 throw new IllegalArgumentException("Solo se agregan repuestos a órdenes Pendiente o En Proceso. "
@@ -152,17 +217,19 @@ public class OrdenServicioServicio {
                 throw new IllegalArgumentException("El repuesto '" + datos.nombre() + "' no tiene precio de venta.");
             }
             int disponible = datos.stock() - repuestos.totalReservado(c, repuesto);
+            observador.verificando(Math.max(disponible, 0));
             if (cantidad > disponible) {
-                throw new IllegalArgumentException(String.format(
+                throw new StockInsuficienteException(String.format(
                         "Stock insuficiente de '%s'. Pediste %d y hay %d disponibles (stock %d, ya reservado %d).",
-                        datos.nombre(), cantidad, Math.max(disponible, 0), datos.stock(), datos.stock() - disponible));
+                        datos.nombre(), cantidad, Math.max(disponible, 0), datos.stock(), datos.stock() - disponible),
+                        Math.max(disponible, 0));
             }
             if (repuestos.reservasDe(c, orden).stream()
                     .anyMatch(reserva -> reserva.getRepuestoId() == repuesto && reserva.estaActiva())) {
                 throw new IllegalArgumentException("Ese repuesto ya está asignado a la orden.");
             }
             repuestos.reservar(c, orden, repuesto, cantidad, datos.precioVenta());
-            return null;
+            return disponible - cantidad;
         });
     }
 
@@ -288,7 +355,7 @@ public class OrdenServicioServicio {
         }
     }
 
-    public void asignarRepuesto(int orden, int repuesto, int cantidad) throws SQLException {
-        agregarRepuesto(orden, repuesto, cantidad);
+    public int asignarRepuesto(int orden, int repuesto, int cantidad) throws SQLException {
+        return agregarRepuesto(orden, repuesto, cantidad);
     }
 }
